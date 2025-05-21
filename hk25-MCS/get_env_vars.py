@@ -128,7 +128,7 @@ def add_circular_trigger_areas_df(filtered_df, RADII, hp_grid, ocean_mask=None, 
     return trigger_areas, filtered_df
 
 def extract_var_statistics_fast(trigger_areas, filtered_df, ds_variable, RADII, time_tolerance=pd.Timedelta('1H'), 
-                              times_before_init=None, include_full_evolution=False):
+                              times_before_init=None, include_full_evolution=False, latvar='meanlat', lonvar='meanlon'):
     """Ultra-optimized function that extracts only summary statistics for each area
     
     Parameters:
@@ -147,6 +147,10 @@ def extract_var_statistics_fast(trigger_areas, filtered_df, ds_variable, RADII, 
         If provided, extract data for this time period before each track's start time (initiation)
     include_full_evolution : bool, optional
         If True, include all times in the track's lifecycle after initiation (default: False)
+    latvar : str, optional
+        Name of latitude variable (default: 'meanlat')
+    lonvar : str, optional
+        Name of longitude variable (default: 'meanlon')
     
     Returns:
     --------
@@ -305,11 +309,25 @@ def extract_var_statistics_fast(trigger_areas, filtered_df, ds_variable, RADII, 
             if isinstance(filtered_df.index[0], tuple):
                 track_indices = [idx for idx in filtered_df.index if idx[0] == track_id]
                 track_data = filtered_df.loc[track_indices[0]]
+
+
+                # Get track rows for all times
+                track_rows = filtered_df.loc[[idx for idx in filtered_df.index if idx[0] == track_id]]
+                # Convert to DataFrame if it's a Series (in case of only one row)
+                if isinstance(track_rows, pd.Series):
+                    track_rows = pd.DataFrame([track_rows])
+
             else:
                 track_data = filtered_df.loc[track_id]
+                track_rows = filtered_df.loc[[track_id]]
+                if isinstance(track_rows, pd.Series):
+                    track_rows = pd.DataFrame([track_rows])
+            
+            # Extract track duration (same for all times in this track)
+            track_duration = float(track_data['mcs_duration']) if 'mcs_duration' in track_data else np.nan
             
             # Use start_basetime as the reference time for all time offsets
-            reference_time = pd.Timestamp(track_data['start_basetime'])
+            start_basetime = pd.Timestamp(track_data['start_basetime'])
             
             for radius in RADII:
                 # Try different key formats
@@ -327,26 +345,80 @@ def extract_var_statistics_fast(trigger_areas, filtered_df, ds_variable, RADII, 
                 # Process each time point in the range
                 for current_time in track_times:
                     # Calculate time offset in hours (negative = before init, positive = after init)
-                    time_offset = (current_time - reference_time).total_seconds() / 3600
+                    time_offset = (current_time - start_basetime).total_seconds() / 3600
                     
                     # Extract just this area's data for this time
                     try:
                         area_data = data_chunk.sel(time=current_time, cell=pixels)
+
+                        # Get the latitude/longitude for this track at this time
+                        # For pre-convective times use the initiation position
+                        if time_offset < 0:  # pre-convective time
+                            lat = float(track_data[latvar]) if latvar in track_data else np.nan
+                            lon = float(track_data[lonvar]) if lonvar in track_data else np.nan
+                            
+                            # For pre-convective times, time-specific MCS properties are NaN
+                            pf_area = np.nan
+                            pf_rainrate = np.nan
+                            area = np.nan
+                            total_rain = np.nan
+                        else:
+                            # For post-initiation times, try to find the matching time in track_rows
+                            # Convert current_time to the same format as in filtered_df
+                            current_time_str = current_time.strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            # Find the row with the closest base_time to current_time
+                            time_diffs = []
+                            for _, row in track_rows.iterrows():
+                                if 'base_time' in row:
+                                    row_time = pd.Timestamp(row['base_time'])
+                                    time_diffs.append((abs(row_time - current_time), row))
+                            
+                            if time_diffs:
+                                # Sort by time difference and take the closest
+                                time_diffs.sort(key=lambda x: x[0])
+                                closest_row = time_diffs[0][1]
+                                
+                                # Extract values from the closest row
+                                lat = float(closest_row[latvar]) if latvar in closest_row else np.nan
+                                lon = float(closest_row[lonvar]) if lonvar in closest_row else np.nan
+                                
+                                # MCS-specific properties
+                                pf_area = float(closest_row['pf_area']) if 'pf_area' in closest_row else np.nan
+                                pf_rainrate = float(closest_row['pf_rainrate']) if 'pf_rainrate' in closest_row else np.nan
+                                area = float(closest_row['area']) if 'area' in closest_row else np.nan
+                                total_rain = float(closest_row['total_rain']) if 'total_rain' in closest_row else np.nan
+                            else:
+                                # Default values if no matching time found
+                                lat = float(track_data[latvar]) if latvar in track_data else np.nan
+                                lon = float(track_data[lonvar]) if lonvar in track_data else np.nan
+                                pf_area = np.nan
+                                pf_rainrate = np.nan
+                                area = np.nan
+                                total_rain = np.nan
                         
                         # Calculate statistics
                         stats = {
                             'track': track_id,  # Store just the track ID, not the tuple
                             'radius': radius,
                             'matched_time': current_time,
-                            'reference_time': reference_time,
+                            'start_basetime': start_basetime,
                             'time_offset_hours': time_offset,
+                            'latitude': lat,
+                            'longitude': lon,
                             'mean': float(area_data.mean().values),
                             'median': float(np.nanmedian(area_data.values)),
                             'min': float(area_data.min().values),
                             'max': float(area_data.max().values),
                             'std': float(area_data.std().values),
                             'count': len(pixels),
-                            'valid_count': int(np.sum(~np.isnan(area_data.values)))
+                            'valid_count': int(np.sum(~np.isnan(area_data.values))),
+                            # Additional fields
+                            'track_duration': track_duration,
+                            'pf_area': pf_area,
+                            'pf_rainrate': pf_rainrate, 
+                            'area': area,
+                            'total_rain': total_rain
                         }
                         results.append(stats)
                     except Exception as e:
