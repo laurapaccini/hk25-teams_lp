@@ -1,6 +1,3 @@
-# Author: Laura Paccini (laura.paccini@pnnl.gov)
-# Date: May 15, 2025
-# Description: Script to extract environmental variables around MCS locations
 import os
 import argparse
 import numpy as np
@@ -219,28 +216,43 @@ def extract_var_statistics_fast(trigger_areas, filtered_df, ds_variable, RADII, 
                 
             # 2. Add full evolution times if requested
             if include_full_evolution:
-                # Get all available times from the track's lifecycle
+                # Get track duration and initiation time
+                init_time = pd.Timestamp(track_data['start_basetime'])
+                duration = int(track_data['mcs_duration']) if 'mcs_duration' in track_data else 0
+                
+                # Calculate the expected end time based on duration
+                expected_end_time = init_time + pd.Timedelta(hours=duration)
+                
+                # Also get the actual end time from the latest base_time
+                actual_end_time = init_time  # default
                 if isinstance(filtered_df.index[0], tuple):
-                    # For tuple indices, we need to find all timestamps in the dataset
-                    # that match any of this track's base_times (within tolerance)
-                    for base_time in track_base_times:
-                        if time_tolerance is not None:
-                            # Find closest time within tolerance
-                            closest_idx = np.abs(available_times - base_time).argmin()
-                            if abs(available_times[closest_idx] - base_time) <= time_tolerance:
-                                analysis_times.append(available_times[closest_idx])
-                        elif base_time in available_times:
-                            analysis_times.append(base_time)
+                    track_times = [pd.Timestamp(row['base_time']) for _, row in track_rows.iterrows()]
+                    if track_times:
+                        actual_end_time = max(track_times)
                 else:
-                    # For single index, just add the base_time
-                    base_time = pd.Timestamp(track_data['base_time'])
-                    if time_tolerance is not None:
-                        closest_idx = np.abs(available_times - base_time).argmin()
-                        if abs(available_times[closest_idx] - base_time) <= time_tolerance:
-                            analysis_times.append(available_times[closest_idx])
-                    elif base_time in available_times:
-                        analysis_times.append(base_time)
-            
+                    actual_end_time = pd.Timestamp(track_data['base_time'])
+                
+                # Use the later of the two end times
+                end_time = max(expected_end_time, actual_end_time)
+                
+                # Find ALL available times between init_time and end_time
+                post_init_times = available_times[(available_times >= init_time) & 
+                                                (available_times <= end_time)]
+                
+                # Add these times to analysis_times
+                analysis_times.extend(post_init_times)  
+                
+                # Ensure we have hourly intervals by also generating specific points
+                for hour in range(duration + 1):  # +1 to include final hour
+                    target_time = init_time + pd.Timedelta(hours=hour)
+                    closest_idx = np.abs(available_times - target_time).argmin()
+                    closest_time = available_times[closest_idx]
+                    if abs(closest_time - target_time) <= time_tolerance:
+                        analysis_times.append(closest_time)
+                
+                # Make sure times are unique
+                analysis_times = list(set(analysis_times))
+                        
             # 3. If neither pre-convective nor full evolution requested, just use base_time
             if not times_before_init and not include_full_evolution:
                 request_time = pd.Timestamp(track_data['base_time'])
@@ -326,6 +338,9 @@ def extract_var_statistics_fast(trigger_areas, filtered_df, ds_variable, RADII, 
             # Extract track duration (same for all times in this track)
             track_duration = float(track_data['mcs_duration']) if 'mcs_duration' in track_data else np.nan
             
+            # Extract start_split_cloudnumber (value at time=0)
+            start_split_cloudnumber = float(track_data['start_split_cloudnumber']) if 'start_split_cloudnumber' in track_data and not pd.isna(track_data['start_split_cloudnumber']) else np.nan
+            
             # Use start_basetime as the reference time for all time offsets
             start_basetime = pd.Timestamp(track_data['start_basetime'])
             
@@ -362,6 +377,11 @@ def extract_var_statistics_fast(trigger_areas, filtered_df, ds_variable, RADII, 
                             pf_rainrate = np.nan
                             area = np.nan
                             total_rain = np.nan
+                            
+                            # For pre-initiation times, mcs_status is NaN and start_split_cloudnumber is from time=0
+                            mcs_status = np.nan
+                            # start_split_cloudnumber already extracted from time=0 above
+                            
                         else:
                             # For post-initiation times, try to find the matching time in track_rows
                             # Convert current_time to the same format as in filtered_df
@@ -388,6 +408,9 @@ def extract_var_statistics_fast(trigger_areas, filtered_df, ds_variable, RADII, 
                                 pf_rainrate = float(closest_row['pf_rainrate']) if 'pf_rainrate' in closest_row else np.nan
                                 area = float(closest_row['area']) if 'area' in closest_row else np.nan
                                 total_rain = float(closest_row['total_rain']) if 'total_rain' in closest_row else np.nan
+                                
+                                # Get mcs_status for this time
+                                mcs_status = int(closest_row['mcs_status']) if 'mcs_status' in closest_row and not pd.isna(closest_row['mcs_status']) else np.nan
                             else:
                                 # Default values if no matching time found
                                 lat = float(track_data[latvar]) if latvar in track_data else np.nan
@@ -396,6 +419,7 @@ def extract_var_statistics_fast(trigger_areas, filtered_df, ds_variable, RADII, 
                                 pf_rainrate = np.nan
                                 area = np.nan
                                 total_rain = np.nan
+                                mcs_status = np.nan
                         
                         # Calculate statistics
                         stats = {
@@ -418,7 +442,10 @@ def extract_var_statistics_fast(trigger_areas, filtered_df, ds_variable, RADII, 
                             'pf_area': pf_area,
                             'pf_rainrate': pf_rainrate, 
                             'area': area,
-                            'total_rain': total_rain
+                            'total_rain': total_rain,
+                            # New fields
+                            'mcs_status': mcs_status,
+                            'start_split_cloudnumber': start_split_cloudnumber
                         }
                         results.append(stats)
                     except Exception as e:
@@ -491,6 +518,26 @@ def prepare_data(filtered_df, lat_bounds, lonvar, latvar, hp_grid):
     
     filtered_df['trigger_idx'] = pixel_indices_smooth
     return filtered_df
+
+def prepare_mcs_tracks(subset_mcs_stats):
+    """Extract MCS track information 
+    
+    Parameters:
+    -----------
+    subset_mcs_stats : xarray.Dataset
+        Dataset with MCS track information
+    
+    Returns:
+    --------
+    xarray.Dataset
+        Dataset with all tracks included
+    """
+    # Save start location of tracks (for all tracks)
+    subset_mcs_stats['start_lat'] = subset_mcs_stats['meanlat'].isel(times=0)
+    subset_mcs_stats['start_lon'] = subset_mcs_stats['meanlon'].isel(times=0)
+    
+    print(f"Using all tracks without filtering: {len(subset_mcs_stats.tracks)} tracks")
+    return subset_mcs_stats
 
 def parse_radii(radii_str):
     """Parse radii string from bash to numpy array"""
@@ -638,27 +685,21 @@ def main():
     
     # Subsample relevant information
     subset_mcs_stats = mcs_trackstats[
-        ['start_split_cloudnumber', 'start_basetime', 'base_time', 'meanlon', 'meanlat',
+        ['start_split_cloudnumber', 'start_basetime', 'base_time', 'meanlon', 'meanlat','mcs_status',
          'mcs_duration', 'meanlon_smooth', 'meanlat_smooth']
     ].compute()
     
-    # Select tracks that don't start as a splitter
-    mcs_tracks_triggered = subset_mcs_stats.where(
-        np.isnan(subset_mcs_stats["start_split_cloudnumber"]), drop=True
-    )
+    # Get all tracks without filtering
+    mcs_tracks_all = prepare_mcs_tracks(subset_mcs_stats)
     
     # Use lat/lon variable names from command line
     latvar = args.lat_var
     lonvar = args.lon_var
     
-    # Save start location of tracks
-    mcs_tracks_triggered['start_lat'] = mcs_tracks_triggered[latvar].isel(times=0)
-    mcs_tracks_triggered['start_lon'] = mcs_tracks_triggered[lonvar].isel(times=0)
-    
     # Convert to DataFrame and filter
-    df = mcs_tracks_triggered.to_dataframe()
+    df = mcs_tracks_all.to_dataframe()
     
-    # Apply filters with pandas
+    # Apply filters with pandas (spatial and temporal only, no MCS status filtering)
     filter_conditions = [
         (df['start_lat'] > lat_bounds[0]),
         (df['start_lat'] < lat_bounds[1]),
@@ -722,9 +763,9 @@ def main():
     start_date_str = args.start_date.replace('-', '') if args.start_date else "unknown"
     end_date_str = args.end_date.replace('-', '') if args.end_date else "unknown"
     output_file = os.path.join(
-    args.output_dir,
-    f"{args.variable}_stats_{start_date_str}_{end_date_str}"
-)
+        args.output_dir,
+        f"{args.variable}_stats_{start_date_str}_{end_date_str}_mcs"
+    )
     
     # Save results
     save_results(var_stats, output_file, format=args.output_format)
